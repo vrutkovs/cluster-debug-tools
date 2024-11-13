@@ -1,6 +1,7 @@
 package certinspection
 
 import (
+	"context"
 	"crypto/x509"
 	"fmt"
 	"strings"
@@ -98,6 +99,10 @@ func (o *CertInspectionOptions) Validate() error {
 func (o *CertInspectionOptions) Run() error {
 	visitor := o.resourceFinder.Do()
 
+	inClusterResourceData := &certgraphapi.PerInClusterResourceData{}
+	certs := []*certgraphapi.CertKeyPair{}
+	caBundles := []*certgraphapi.CertificateAuthorityBundle{}
+
 	err := visitor.Visit(func(info *resource.Info, err error) error {
 		if err != nil {
 			return err
@@ -105,11 +110,18 @@ func (o *CertInspectionOptions) Run() error {
 
 		switch castObj := info.Object.(type) {
 		case *corev1.ConfigMap:
-			inspectConfigMap(castObj)
+			if details := inspectConfigMap(castObj); details != nil {
+				caBundles = append(caBundles, details)
+			}
 		case *corev1.Secret:
-			inspectSecret(castObj)
-		// case *certificatesv1beta1.CertificateSigningRequest:
-		// 	inspectCSR(castObj)
+			details := inspectSecret(castObj)
+			for _, detail := range details {
+				if detail != nil {
+					certs = append(certs, detail)
+				}
+			}
+		case *certificatesv1beta1.CertificateSigningRequest:
+			inspectCSR(castObj)
 		default:
 			return fmt.Errorf("unhandled resource: %T", castObj)
 		}
@@ -120,42 +132,45 @@ func (o *CertInspectionOptions) Run() error {
 	if err != nil {
 		return err
 	}
-
+	ctx := context.Background()
+	pkiList := certgraphanalysis.PKIListFromParts(ctx, inClusterResourceData, certs, caBundles)
+	printPKIList(pkiList)
 	return nil
 }
 
-func inspectConfigMap(obj *corev1.ConfigMap) {
+func inspectConfigMap(obj *corev1.ConfigMap) *certgraphapi.CertificateAuthorityBundle {
 	resourceString := fmt.Sprintf("configmaps/%s[%s]", obj.Name, obj.Namespace)
-	caBundle, err := certgraphanalysis.InspectConfigMap(obj)
-	if err != nil {
-		fmt.Printf("%s ERROR - %v\n", resourceString, err)
-		return
+	var err error
+	var caBundle *certgraphapi.CertificateAuthorityBundle
+
+	caBundle, err = certgraphanalysis.InspectConfigMapAsKubeConfig(obj)
+	if err == nil {
+		caBundle, err = certgraphanalysis.InspectConfigMap(obj)
+		if err != nil {
+			fmt.Printf("%s ERROR - %v\n", resourceString, err)
+			return nil
+		}
 	}
+
 	if caBundle == nil {
 		fmt.Printf("%s - not a caBundle\n", resourceString)
-		return
+		return nil
 	}
-	fmt.Printf("%s - ca bundle (%v)\n", resourceString, obj.CreationTimestamp.UTC())
-	for _, curr := range caBundle.Spec.CertificateMetadata {
-		fmt.Printf("    %s\n", certMetadataDetail(curr))
-	}
+	return caBundle
 }
 
-func inspectSecret(obj *corev1.Secret) {
+func inspectSecret(obj *corev1.Secret) []*certgraphapi.CertKeyPair {
 	resourceString := fmt.Sprintf("secrets/%s[%s]", obj.Name, obj.Namespace)
 	secrets, err := certgraphanalysis.InspectSecret(obj)
 	if err != nil {
 		fmt.Printf("%s ERROR - %v\n", resourceString, err)
-		return
+		return nil
 	}
 	if len(secrets) == 0 {
 		fmt.Printf("%s - not a secret\n", resourceString)
-		return
+		return nil
 	}
-	fmt.Printf("%s - tls (%v)\n", resourceString, obj.CreationTimestamp.UTC())
-	for _, secret := range secrets {
-		fmt.Printf("    %s\n", certMetadataDetail(secret.Spec.CertMetadata))
-	}
+	return secrets
 }
 
 func inspectCSR(obj *certificatesv1beta1.CertificateSigningRequest) {
@@ -201,9 +216,7 @@ func certDetail(certificate *x509.Certificate) string {
 	for _, ip := range certificate.IPAddresses {
 		validServingNames = append(validServingNames, ip.String())
 	}
-	for _, dnsName := range certificate.DNSNames {
-		validServingNames = append(validServingNames, dnsName)
-	}
+	validServingNames = append(validServingNames, certificate.DNSNames...)
 	servingString := ""
 	if len(validServingNames) > 0 {
 		servingString = fmt.Sprintf(" validServingFor=[%s]", strings.Join(validServingNames, ","))
@@ -217,7 +230,22 @@ func certDetail(certificate *x509.Certificate) string {
 	return fmt.Sprintf("%q [%s]%s%s issuer=%q (%v to %v)", humanName, strings.Join(usages, ","), groupString, servingString, signerHumanName, certificate.NotBefore.UTC(), certificate.NotAfter.UTC())
 }
 
-func certMetadataDetail(certKeyMetadata certgraphapi.CertKeyMetadata) string {
+func printPKIList(pkiList *certgraphapi.PKIList) {
+	for _, certKeyPair := range pkiList.CertKeyPairs.Items {
+		for _, location := range certKeyPair.Spec.SecretLocations {
+			fmt.Printf("secret/%s[%s]\n", location.Name, location.Namespace)
+		}
+		fmt.Printf("%s\n\n", certMetadataDetail(certKeyPair.Spec.CertMetadata, pkiList))
+	}
+	for _, certKeyPair := range pkiList.CertKeyPairs.Items {
+		for _, location := range certKeyPair.Spec.SecretLocations {
+			fmt.Printf("configmap/%s[%s]\n", location.Name, location.Namespace)
+		}
+		fmt.Printf("%s\n\n", certMetadataDetail(certKeyPair.Spec.CertMetadata, pkiList))
+	}
+}
+
+func certMetadataDetail(certKeyMetadata certgraphapi.CertKeyMetadata, pkiList *certgraphapi.PKIList) string {
 	issuer := ""
 	if certKeyMetadata.CertIdentifier.Issuer != nil {
 		issuer = certKeyMetadata.CertIdentifier.Issuer.CommonName
@@ -225,11 +253,32 @@ func certMetadataDetail(certKeyMetadata certgraphapi.CertKeyMetadata) string {
 	if issuer == certKeyMetadata.CertIdentifier.CommonName {
 		issuer = "<self>"
 	}
+	// Find the issuer in known certs
+	for _, certKeyPair := range pkiList.CertKeyPairs.Items {
+		if certKeyPair.Spec.CertMetadata.CertIdentifier.CommonName != issuer {
+			continue
+		}
+
+		// Don't show too many locations
+		upToTenLocations := min(10, len(certKeyPair.Spec.SecretLocations))
+		issuer = fmt.Sprintf("%s\n    Issuer found in:", issuer)
+		for _, location := range certKeyPair.Spec.SecretLocations[:upToTenLocations] {
+			issuer = fmt.Sprintf("%s\n        secret/%s[%s]", issuer, location.Name, location.Namespace)
+		}
+		if len(certKeyPair.Spec.SecretLocations) != upToTenLocations {
+			issuer = fmt.Sprintf("%s\n        ...", issuer)
+		}
+		break
+	}
+
 	return fmt.Sprintf(
-		"%q [%s] issuer=%q (%v)",
+		"    %q [%s] \n    sn=%v issuer=%v\n    not-before=%v not-after=%v (%v)",
 		certKeyMetadata.CertIdentifier.CommonName,
 		strings.Join(certKeyMetadata.Usages, ","),
+		certKeyMetadata.CertIdentifier.SerialNumber,
 		issuer,
+		certKeyMetadata.NotBefore,
+		certKeyMetadata.NotAfter,
 		certKeyMetadata.ValidityDuration,
 	)
 }
