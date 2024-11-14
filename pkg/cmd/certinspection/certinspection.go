@@ -135,7 +135,7 @@ func inspectConfigMap(obj *corev1.ConfigMap) {
 		fmt.Printf("%s - not a caBundle\n", resourceString)
 		return
 	}
-	fmt.Printf("%s - ca bundle (%v)\n", resourceString, obj.CreationTimestamp.UTC())
+	fmt.Printf("%s - ca bundle (created %v)\n", resourceString, obj.CreationTimestamp.UTC())
 	for _, curr := range caBundle.Spec.CertificateMetadata {
 		fmt.Printf("    %s\n", certMetadataDetail(curr))
 	}
@@ -152,7 +152,7 @@ func inspectSecret(obj *corev1.Secret) {
 		fmt.Printf("%s - not a secret\n", resourceString)
 		return
 	}
-	fmt.Printf("%s - tls (%v)\n", resourceString, obj.CreationTimestamp.UTC())
+	fmt.Printf("%s - tls (created %v)\n", resourceString, obj.CreationTimestamp.UTC())
 	for _, secret := range secrets {
 		fmt.Printf("    %s\n", certMetadataDetail(secret.Spec.CertMetadata))
 	}
@@ -226,10 +226,12 @@ func certMetadataDetail(certKeyMetadata certgraphapi.CertKeyMetadata) string {
 		issuer = "<self>"
 	}
 	return fmt.Sprintf(
-		"%q [%s] issuer=%q (%v)",
+		"%q [%s] issuer=%q not-before=%v not-after=%v (%v)",
 		certKeyMetadata.CertIdentifier.CommonName,
 		strings.Join(certKeyMetadata.Usages, ","),
 		issuer,
+		certKeyMetadata.NotBefore,
+		certKeyMetadata.NotAfter,
 		certKeyMetadata.ValidityDuration,
 	)
 }
