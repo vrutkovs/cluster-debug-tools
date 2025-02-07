@@ -126,11 +126,18 @@ func (o *CertInspectionOptions) Run() error {
 
 func inspectConfigMap(obj *corev1.ConfigMap) {
 	resourceString := fmt.Sprintf("configmaps/%s[%s]", obj.Name, obj.Namespace)
-	caBundle, err := certgraphanalysis.InspectConfigMap(obj)
-	if err != nil {
-		fmt.Printf("%s ERROR - %v\n", resourceString, err)
-		return
+	var err error
+	var caBundle *certgraphapi.CertificateAuthorityBundle
+
+	caBundle, err = certgraphanalysis.InspectConfigMapAsKubeConfig(obj)
+	if err == nil {
+		caBundle, err = certgraphanalysis.InspectConfigMap(obj)
+		if err != nil {
+			fmt.Printf("%s ERROR - %v\n", resourceString, err)
+			return
+		}
 	}
+
 	if caBundle == nil {
 		fmt.Printf("%s - not a caBundle\n", resourceString)
 		return
