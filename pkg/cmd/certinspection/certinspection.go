@@ -233,12 +233,13 @@ func certMetadataDetail(certKeyMetadata certgraphapi.CertKeyMetadata) string {
 		issuer = "<self>"
 	}
 	return fmt.Sprintf(
-		"%q [%s] issuer=%q not-before=%v not-after=%v (%v)",
+		"%q [%s] issuer=%q not-before=%v not-after=%v (%v) sn=%v",
 		certKeyMetadata.CertIdentifier.CommonName,
 		strings.Join(certKeyMetadata.Usages, ","),
 		issuer,
 		certKeyMetadata.NotBefore,
 		certKeyMetadata.NotAfter,
 		certKeyMetadata.ValidityDuration,
+		certKeyMetadata.CertIdentifier.SerialNumber,
 	)
 }
